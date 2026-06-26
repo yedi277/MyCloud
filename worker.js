@@ -40,10 +40,14 @@ async function incrementStat(env, key, delta = 1) {
   await env.KV_STORE.put(key, String(Math.max(0, val)));
 }
 
+function base64UrlEncode(str) {
+  return btoa(str).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
 async function createJWT(payload, secret) {
   const header = { alg: 'HS256', typ: 'JWT' };
-  const encodedHeader = btoa(JSON.stringify(header)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const encodedPayload = btoa(JSON.stringify(payload)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
 
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
@@ -60,8 +64,7 @@ async function createJWT(payload, secret) {
     encoder.encode(`${encodedHeader}.${encodedPayload}`)
   );
 
-  const encodedSignature = btoa(String.fromCharCode(...new Uint8Array(signature)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+  const encodedSignature = base64UrlEncode(String.fromCharCode(...new Uint8Array(signature)));
 
   return `${encodedHeader}.${encodedPayload}.${encodedSignature}`;
 }
@@ -120,6 +123,17 @@ function formatFileSize(bytes) {
   const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
   return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function formatTime(isoStr) {
+  if (!isoStr) return '-';
+  const d = new Date(isoStr);
+  const now = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  const mmdd = pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  const hhmm = pad(d.getHours()) + ':' + pad(d.getMinutes());
+  if (d.getFullYear() === now.getFullYear()) return mmdd + ' ' + hhmm;
+  return String(d.getFullYear()).slice(2) + '-' + mmdd + ' ' + hhmm;
 }
 
 function getMimeType(filename) {
@@ -286,22 +300,28 @@ function normalizePath(p) {
   return p;
 }
 
-function checkGuestAccess(auth, key) {
-  if (auth.role === 'guest' && !key.startsWith('guest/')) {
-    return jsonResponse({ success: false, message: '游客只能操作 guest/ 文件夹' }, 403);
-  }
-  return null;
+function normalizeFolder(f) {
+  if (!f) return '';
+  return f.replace(/^\/+|\/+$/g, '');
 }
 
-async function checkFolderAccess(auth, env, targetPath) {
-  if (!auth.email) return null;
-  const limits = await getUserLimits(env, auth.email);
-  if (!limits || !limits.allowedFolders || limits.allowedFolders.length === 0) return null;
+async function checkPathAccess(auth, env, targetPath) {
+  // 通用路径权限检查：同时处理游客和注册用户
+  const key = auth.role === 'guest' ? '__guest__' : (auth.email || null);
+  if (!key) return null;
+  const limits = await getUserLimits(env, key);
+  if (!limits.allowedFolders || limits.allowedFolders.length === 0) return null;
+  const t = normalizeFolder(targetPath);
   const allowed = limits.allowedFolders.some(f => {
-    const norm = f.replace(/^\/+|\/+$/g, '');
-    return targetPath === norm || targetPath.startsWith(norm + '/') || targetPath.startsWith('/' + norm) || targetPath.startsWith('/' + norm + '/');
+    const norm = normalizeFolder(f);
+    return t === norm || t.startsWith(norm + '/');
   });
-  if (!allowed) return jsonResponse({ success: false, message: '你没有权限执行此操作' }, 403);
+  if (!allowed) {
+    const msg = auth.role === 'guest'
+      ? `游客只能访问 ${limits.allowedFolders.join(', ')} 文件夹`
+      : '你没有权限执行此操作';
+    return jsonResponse({ success: false, message: msg }, 403);
+  }
   return null;
 }
 
@@ -314,10 +334,59 @@ async function handleListFiles(request, env, path) {
     if (prefix && !prefix.endsWith('/')) prefix += '/';
 
     if (auth.role === 'guest') {
-      if (!prefix.startsWith('guest/')) prefix = 'guest/';
+      const limits = await getUserLimits(env, '__guest__');
+      const allowedFolders = (limits && limits.allowedFolders && limits.allowedFolders.length > 0)
+        ? limits.allowedFolders
+        : ['guest'];
+      // 如果请求的是根目录或不在允许范围内，默认显示第一个允许的文件夹
+      const guestRoot = normalizeFolder(allowedFolders[0]) + '/';
+      if (prefix === '' || prefix === '/') {
+        prefix = guestRoot;
+      } else {
+        const guestErr = await checkPathAccess(auth, env, prefix.replace(/\/+$/, ''));
+        if (guestErr) return guestErr;
+      }
     }
 
-    const accessErr = await checkFolderAccess(auth, env, prefix.replace(/\/+$/, ''));
+    // 非游客受限用户：根目录列出允许的文件夹（而非跳转到第一个）
+    if (auth.email && auth.role !== 'guest' && (prefix === '' || prefix === '/')) {
+      const limits = await getUserLimits(env, auth.email);
+      if (limits && limits.allowedFolders && limits.allowedFolders.length > 0) {
+        const allListed = await env.R2_BUCKET.list({ delimiter: '/' });
+        const allowedSet = new Set(limits.allowedFolders.map(f => normalizeFolder(f)));
+
+        const files = [];
+        const folders = [];
+
+        if (allListed.delimitedPrefixes) {
+          for (const folderPath of allListed.delimitedPrefixes) {
+            const name = folderPath.slice(0, -1);
+            if (allowedSet.has(name)) {
+              folders.push({ name, path: '/' + name });
+            }
+          }
+        }
+
+        if (allListed.objects) {
+          for (const obj of allListed.objects) {
+            const name = obj.key;
+            if (!name.includes('/') && allowedSet.has(name)) {
+              const previewType = getPreviewType(name);
+              files.push({
+                name, path: '/' + obj.key, size: obj.size,
+                sizeFormatted: formatFileSize(obj.size),
+                timeFormatted: formatTime(obj.uploaded.toISOString()),
+                lastModified: obj.uploaded.toISOString(), previewType
+              });
+            }
+          }
+        }
+
+        return jsonResponse({ success: true, files, folders, currentPath: '/' });
+      }
+    }
+
+    const accessErr = await checkPathAccess(auth, env, prefix.replace(/\/+$/, ''));
     if (accessErr) return accessErr;
 
     const listed = await env.R2_BUCKET.list({ prefix, delimiter: '/' });
@@ -344,6 +413,7 @@ async function handleListFiles(request, env, path) {
             path: '/' + obj.key,
             size: obj.size,
             sizeFormatted: formatFileSize(obj.size),
+            timeFormatted: formatTime(obj.uploaded.toISOString()),
             lastModified: obj.uploaded.toISOString(),
             previewType
           });
@@ -372,16 +442,33 @@ async function handleSearchFiles(request, env) {
     let pages = 0;
     const maxPages = mode === 'full' ? 9999 : 10;
 
+    // 游客搜索范围：读取一次权限设置
+    let guestAllowedFolders = null;
+    if (auth.role === 'guest') {
+      const limits = await getUserLimits(env, '__guest__');
+      guestAllowedFolders = (limits && limits.allowedFolders && limits.allowedFolders.length > 0)
+        ? limits.allowedFolders.map(f => normalizeFolder(f))
+        : ['guest'];
+    }
+
     do {
       pages++;
       const options = cursor ? { cursor, limit: 1000 } : { limit: 1000 };
-      if (auth.role === 'guest') options.prefix = 'guest/';
+      // 游客多文件夹：不设置 prefix，拉全部后在循环里过滤
+      if (guestAllowedFolders && guestAllowedFolders.length === 1) {
+        options.prefix = guestAllowedFolders[0] + '/';
+      }
 
       const listed = await env.R2_BUCKET.list(options);
       if (!listed.objects) break;
 
       for (const obj of listed.objects) {
-        if (auth.role === 'guest' && !obj.key.startsWith('guest/')) continue;
+        if (guestAllowedFolders) {
+          const hasAccess = guestAllowedFolders.some(norm => {
+            return obj.key.startsWith(norm + '/') || obj.key === norm || obj.key === norm + '/';
+          });
+          if (!hasAccess) continue;
+        }
         const name = obj.key.split('/').pop();
         if (name && name.toLowerCase().includes(query)) {
           const parts = obj.key.split('/');
@@ -392,6 +479,7 @@ async function handleSearchFiles(request, env) {
             folder: folderPath,
             size: obj.size,
             sizeFormatted: formatFileSize(obj.size),
+            timeFormatted: formatTime(obj.uploaded.toISOString()),
             lastModified: obj.uploaded.toISOString()
           });
         }
@@ -444,6 +532,21 @@ async function handleRemoveFavorite(request, env) {
   return jsonResponse({ success: true, favorites });
 }
 
+async function handleReorderFavorites(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  try {
+    const { favorites } = await request.json();
+    if (!Array.isArray(favorites)) return jsonResponse({ success: false, message: '无效数据' }, 400);
+    const key = getFavoritesKey(auth);
+    await env.KV_STORE.put(key, JSON.stringify(favorites));
+    return jsonResponse({ success: true, favorites });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '保存顺序失败: ' + e.message }, 500);
+  }
+}
+
 function getFavoritesKey(auth) {
   if (auth.role === 'guest') return 'favorites:guest';
   if (auth.role === 'admin') return 'favorites:admin';
@@ -462,13 +565,17 @@ async function handleUploadFile(request, env, path) {
     // 检查上传大小限制
     const globalSettings = await getGlobalSettings(env);
     let maxSize = 0;
+    let limits = null;
+
     if (auth.role === 'guest') {
-      maxSize = globalSettings.maxUploadSize > 0 ? globalSettings.maxUploadSize * 1024 * 1024 : 100 * 1024 * 1024;
+      limits = await getUserLimits(env, '__guest__');
+      if (limits && limits.maxUploadSize > 0) maxSize = limits.maxUploadSize * 1024 * 1024;
+      else if (globalSettings.maxUploadSize > 0) maxSize = globalSettings.maxUploadSize * 1024 * 1024;
     } else if (auth.email) {
-      const limits = await getUserLimits(env, auth.email);
+      limits = await getUserLimits(env, auth.email);
       if (limits && limits.maxUploadSize > 0) maxSize = limits.maxUploadSize * 1024 * 1024;
       else if (limits && limits.maxUploadSize === 0 && globalSettings.maxUploadSize > 0) maxSize = globalSettings.maxUploadSize * 1024 * 1024;
-      const accessErr = await checkFolderAccess(auth, env, normalizePath(path));
+      const accessErr = await checkPathAccess(auth, env, normalizePath(path));
       if (accessErr) return accessErr;
     }
     if (maxSize > 0 && file.size > maxSize) {
@@ -477,7 +584,14 @@ async function handleUploadFile(request, env, path) {
 
     let filePath = normalizePath(path);
     if (filePath && !filePath.endsWith('/')) filePath += '/';
-    if (auth.role === 'guest' && !filePath.startsWith('guest/')) filePath = 'guest/' + filePath;
+    if (auth.role === 'guest') {
+      // 游客上传路径保护：确保落在允许范围内
+      const allowedFolders = (limits && limits.allowedFolders && limits.allowedFolders.length > 0)
+        ? limits.allowedFolders
+        : ['guest'];
+      const guestRoot = normalizeFolder(allowedFolders[0]) + '/';
+      if (!filePath.startsWith(guestRoot)) filePath = guestRoot + filePath;
+    }
 
     const key = filePath + file.name;
     await env.R2_BUCKET.put(key, file.stream(), {
@@ -496,10 +610,10 @@ async function handleDeleteFile(request, env, path) {
   try {
     let key = normalizePath(path);
 
-    const guestErr = checkGuestAccess(auth, key);
+    const guestErr = await checkPathAccess(auth, env, key);
     if (guestErr) return guestErr;
 
-    const accessErr = await checkFolderAccess(auth, env, key.split('/').slice(0, -1).join('/'));
+    const accessErr = await checkPathAccess(auth, env, key.split('/').slice(0, -1).join('/'));
     if (accessErr) return accessErr;
 
     const listed = await env.R2_BUCKET.list({ prefix: key + '/', limit: 1 });
@@ -538,7 +652,7 @@ async function handleRenameFile(request, env, path) {
 
     let oldKey = normalizePath(path);
 
-    const guestErr = checkGuestAccess(auth, oldKey);
+    const guestErr = await checkPathAccess(auth, env, oldKey);
     if (guestErr) return guestErr;
 
     const parentPath = oldKey.includes('/') ? oldKey.substring(0, oldKey.lastIndexOf('/') + 1) : '';
@@ -572,10 +686,10 @@ async function handleCreateFolder(request, env) {
 
     if (!folderPath.endsWith('/')) folderPath += '/';
 
-    const guestErr = checkGuestAccess(auth, folderPath);
+    const guestErr = await checkPathAccess(auth, env, folderPath);
     if (guestErr) return guestErr;
 
-    const accessErr = await checkFolderAccess(auth, env, folderPath.replace(/\/+$/, ''));
+    const accessErr = await checkPathAccess(auth, env, folderPath.replace(/\/+$/, ''));
     if (accessErr) return accessErr;
 
     await env.R2_BUCKET.put(folderPath + '.folder', new Uint8Array(0));
@@ -597,7 +711,7 @@ async function handleCreateFile(request, env) {
 
     filePath = normalizePath(filePath);
 
-    const guestErr = checkGuestAccess(auth, filePath);
+    const guestErr = await checkPathAccess(auth, env, filePath);
     if (guestErr) return guestErr;
 
     const existing = await env.R2_BUCKET.get(filePath);
@@ -813,8 +927,12 @@ async function handleUpdateUserSettings(request, env, email) {
   if (auth instanceof Response) return auth;
   try {
     const { role, maxUploadSize, allowedFolders } = await request.json();
-    const existing = (await getUserLimits(env, email)) || { ...DEFAULT_USER_LIMITS };
-    if (typeof role === 'string' && ['user', 'restricted'].includes(role)) existing.role = role;
+    const isGuest = email === '__guest__';
+    const defaultLimits = isGuest
+      ? { maxUploadSize: 0, allowedFolders: ['guest'] }
+      : { ...DEFAULT_USER_LIMITS };
+    const existing = (await getUserLimits(env, email)) || defaultLimits;
+    if (!isGuest && typeof role === 'string' && ['user', 'restricted'].includes(role)) existing.role = role;
     if (typeof maxUploadSize === 'number' && maxUploadSize >= 0) existing.maxUploadSize = maxUploadSize;
     if (Array.isArray(allowedFolders)) existing.allowedFolders = allowedFolders.filter(f => typeof f === 'string');
     await env.KV_STORE.put(`settings:user:${email}`, JSON.stringify(existing));
@@ -866,6 +984,15 @@ async function handleListUsers(request, env) {
 
   try {
     const users = []; let cursor;
+    // 添加游客 "用户"，方便在列表查看和管理游客登录状态
+    const settings = await getGlobalSettings(env);
+    users.push({
+      email: '__guest__',
+      role: 'guest',
+      enabled: settings.guestLogin,
+      createdAt: null
+    });
+
     do {
       const listed = await env.KV_STORE.list({ prefix: 'user:', cursor });
       for (const key of listed.keys) {
@@ -890,6 +1017,7 @@ async function handleCreateUser(request, env) {
   try {
     const { email, password } = await request.json();
     if (!email || !password) return jsonResponse({ success: false, message: '请提供邮箱和密码' }, 400);
+    if (email === '__guest__') return jsonResponse({ success: false, message: '该邮箱为系统保留' }, 400);
 
     if (await env.KV_STORE.get(`user:${email}`)) return jsonResponse({ success: false, message: '用户已存在' }, 409);
 
@@ -905,6 +1033,7 @@ async function handleCreateUser(request, env) {
 async function handleDeleteUser(request, env, email) {
   const auth = await requireAdmin(request, env);
   if (auth instanceof Response) return auth;
+  if (email === '__guest__') return jsonResponse({ success: false, message: '不能删除游客' }, 400);
   try {
     await env.KV_STORE.delete(`user:${decodeURIComponent(email)}`);
     return jsonResponse({ success: true, message: '用户已删除' });
@@ -1020,163 +1149,12 @@ const CSS_STYLES = `
   .sidebar-item-remove:hover { background: rgba(255,59,48,0.12); color: var(--error); }
   .sidebar-add { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; color: var(--text-muted); transition: all var(--transition); background: none; border: none; font-family: inherit; width: 100%; text-align: left; margin-top: 4px; }
   .sidebar-add:hover { background: var(--surface-hover); color: var(--primary); }
+  .sidebar-item[draggable="true"] { cursor: grab; }
+  .sidebar-item-dragging { opacity: 0.4; cursor: grabbing; }
+  .sidebar-item-drop-target { background: rgba(0,122,255,0.12); border-radius: var(--radius-sm); }
   .sidebar-divider { height: 1px; background: var(--border); margin: 8px 12px; }
   .main-content { flex: 1; min-width: 0; }
   .container { padding: 0; }
-
-  /* Mobile sidebar toggle – hidden on desktop */
-  .sidebar-toggle { display: none; }
-  .sidebar-backdrop { display: none; }
-  .mobile-upload-bar { display: none; }
-
-  /* ==============================================
-     Mobile / Responsive Layout
-     ============================================== */
-  @media (max-width: 768px) {
-    html { font-size: 15px; }
-    body { -webkit-tap-highlight-color: transparent; }
-
-    /* Header – stack + compact */
-    .header { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
-    .logo { font-size: 18px; white-space: nowrap; }
-    .search-group { max-width: 100%; width: 100%; margin: 0; order: 3; }
-    .header-actions { width: auto; gap: 4px; }
-    .header-actions .btn { padding: 6px 12px; font-size: 12px; }
-    #adminBtn { display: none; }
-
-    /* Sidebar – hide by default, toggle via JS */
-    .sidebar {
-      position: fixed; top: 0; left: 0; bottom: 0; z-index: 500;
-      width: 260px; background: var(--surface); box-shadow: var(--shadow-lg);
-      flex-direction: column; padding: 60px 12px 20px; gap: 2px;
-      transform: translateX(-100%); transition: transform 0.25s cubic-bezier(0.4,0,0.2,1);
-      overflow-y: auto; border-right: 1px solid var(--border);
-    }
-    .sidebar.open { transform: translateX(0); }
-    .sidebar-title { display: block; padding: 12px 8px 6px; font-size: 11px; }
-    .sidebar-item { padding: 10px 12px; font-size: 14px; width: 100%; }
-    .sidebar-divider { display: block; margin: 8px 8px; }
-    .sidebar-add { margin-top: 4px; font-size: 13px; padding: 10px 12px; }
-    .sidebar-backdrop {
-      display: none; position: fixed; inset: 0; z-index: 499;
-      background: rgba(0,0,0,0.3); backdrop-filter: blur(2px);
-    }
-    .sidebar-backdrop.active { display: block; }
-
-    /* Hamburger menu button */
-    .sidebar-toggle {
-      display: flex; width: 36px; height: 36px; border: 1px solid var(--border);
-      border-radius: var(--radius-sm); background: var(--surface);
-      cursor: pointer; align-items: center; justify-content: center;
-      font-size: 18px; color: var(--text); transition: all var(--transition);
-      flex-shrink: 0;
-    }
-    .sidebar-toggle:hover { background: var(--surface-hover); }
-    .sidebar-toggle-line { display: none; }
-
-    .main-layout { flex-direction: column; padding: 0; gap: 0; }
-    .main-content { width: 100%; }
-
-    /* Toolbar – compact */
-    .toolbar { gap: 6px; padding: 10px 12px; margin-bottom: 0; }
-    .toolbar .btn { padding: 7px 12px; font-size: 12px; flex: 1; }
-    .view-toggle { flex-shrink: 0; }
-    .view-toggle-btn { padding: 5px 10px; font-size: 14px; }
-    .selection-info.active { margin-left: 0; width: 100%; text-align: center; margin-top: 4px; }
-
-    /* Container */
-    .container { padding: 0; }
-
-    /* File grid – 2 columns for mobile */
-    .file-grid:not(.file-list) { grid-template-columns: repeat(2, 1fr); gap: 8px; min-height: 200px; }
-    .file-item { padding: 12px 8px; gap: 4px; }
-    .file-item .file-icon { font-size: 32px; }
-    .file-item .file-name { font-size: 12px; }
-
-    /* List view – 3 columns: icon | name | size */
-    .file-list .file-item { grid-template-columns: 14% 60% 24%; gap: 2px; padding: 6px 8px; }
-    .file-list-header { grid-template-columns: 14% 60% 24%; gap: 2px; padding: 5px 8px; font-size: 9px; }
-    .file-list .file-icon { font-size: 16px; flex-shrink: 0; }
-    .file-list .file-name { font-size: 12px; word-break: break-word; overflow-wrap: anywhere; line-height: 1.2; min-width: 16ch; }
-    .file-list .file-meta { font-size: 10px; text-align: right; flex-shrink: 0; }
-    .file-list .file-meta:last-child { display: none; }
-    .file-list-header > *:nth-child(3) { text-align: right; }
-    .file-list-header > *:nth-child(4) { display: none; }
-
-    /* Breadcrumb */
-    .breadcrumb { font-size: 12px; padding: 4px 12px; }
-
-    /* Modals */
-    .modal { padding: 20px; width: 94%; max-width: 100%; border-radius: var(--radius-lg); }
-    .modal-title { font-size: 16px; }
-    .modal-overlay { align-items: flex-end; }
-    .modal-overlay .modal {
-      border-radius: var(--radius-xl) var(--radius-xl) 0 0;
-      max-height: 90vh; margin-bottom: 0;
-    }
-
-    /* Login / Share cards */
-    .login-card, .share-card { padding: 28px 20px; max-width: 100%; margin: 0 8px; border-radius: var(--radius-lg); }
-    .login-container { padding: 12px; align-items: flex-start; padding-top: 10vh; }
-
-    /* Preview overlay */
-    .preview-header { padding: 10px 14px; gap: 8px; }
-    .preview-filename { font-size: 14px; }
-    .preview-overlay .btn { padding: 6px 12px; font-size: 12px; }
-
-    /* Admin page */
-    .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
-    .stat-card { padding: 18px 12px; }
-    .stat-value { font-size: 28px; }
-    .stat-label { font-size: 12px; }
-
-    /* Admin tables */
-    .table-container { margin: 0 -8px; }
-    th, td { padding: 8px 10px; font-size: 12px; white-space: nowrap; }
-
-    /* Buttons – touch friendly */
-    .btn { min-height: 40px; }
-    .btn-sm { min-height: 32px; padding: 4px 10px; font-size: 11px; }
-    .modal-close { width: 36px; height: 36px; font-size: 24px; }
-
-    /* Form inputs */
-    .form-input, .form-select { padding: 10px 12px; font-size: 16px; }
-
-    /* Card */
-    .card { padding: 16px 12px; border-radius: var(--radius); }
-
-    /* Footer upload bar (fixed bottom) */
-    .mobile-upload-bar {
-      display: flex; position: fixed; bottom: 0; left: 0; right: 0;
-      padding: 10px 14px; padding-bottom: max(10px, env(safe-area-inset-bottom));
-      background: var(--surface); border-top: 1px solid var(--border);
-      box-shadow: 0 -2px 10px rgba(0,0,0,0.06); z-index: 300;
-      gap: 8px;
-    }
-    .mobile-upload-bar .btn { flex: 1; }
-  }
-
-  /* Extra small screens */
-  @media (max-width: 480px) {
-    .header { padding: 8px 10px; gap: 6px; }
-    .logo { font-size: 16px; }
-    .search-input { font-size: 12px; padding: 6px 30px 6px 10px; }
-    .search-mode-select { font-size: 11px; padding: 0 8px; }
-    .file-item { padding: 10px 6px; }
-    .file-item .file-icon { font-size: 28px; }
-    .file-list .file-item { padding: 5px 6px; }
-    .file-list-header { padding: 4px 6px; font-size: 8px; }
-    .file-list .file-icon { font-size: 15px; }
-    .file-list .file-name { font-size: 11px; }
-    .file-list .file-meta { font-size: 10px; }
-    .toolbar .btn { font-size: 11px; }
-    .stats-grid { grid-template-columns: 1fr; }
-    .tabs { gap: 2px; padding: 3px; }
-    .tab { padding: 8px 12px; font-size: 13px; }
-    .modal { padding: 16px; width: 96%; }
-    .login-card, .share-card { padding: 22px 16px; }
-    .header-actions .btn { padding: 5px 8px; font-size: 11px; }
-  }
 
   /* Buttons */
   .btn {
@@ -1192,6 +1170,7 @@ const CSS_STYLES = `
   .btn-primary:hover {
     background: var(--primary-hover); box-shadow: 0 2px 8px rgba(0,122,255,0.3);
   }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-secondary {
     background: rgba(0,0,0,0.04); color: var(--text);
   }
@@ -1335,8 +1314,8 @@ const CSS_STYLES = `
 
   /* File Grid */
   .file-grid {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 12px; min-height: 300px; position: relative;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 8px; min-height: 200px; position: relative;
   }
   .file-grid.drag-over {
     background: rgba(0,122,255,0.04); border: 2px dashed var(--primary);
@@ -1350,9 +1329,9 @@ const CSS_STYLES = `
 
   .file-item {
     background: var(--surface); border-radius: var(--radius);
-    padding: 16px 12px; cursor: pointer; transition: all var(--transition);
+    padding: 10px 8px; cursor: pointer; transition: all var(--transition);
     border: 1px solid var(--border); position: relative;
-    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
   }
   .file-item:hover {
     border-color: rgba(0,122,255,0.3); box-shadow: var(--shadow);
@@ -1369,13 +1348,13 @@ const CSS_STYLES = `
     border-radius: 50%; display: flex; align-items: center; justify-content: center;
     font-size: 12px; font-weight: 700;
   }
-  .file-icon { font-size: 40px; text-align: center; }
+  .file-icon { font-size: 32px; text-align: center; }
   .file-name {
-    font-size: 13px; font-weight: 500; text-align: center;
+    font-size: 12px; font-weight: 500; text-align: center;
     word-break: break-all; line-height: 1.3;
   }
   .file-meta {
-    font-size: 12px; color: var(--text-muted); text-align: center;
+    font-size: 11px; color: var(--text-muted); text-align: center;
   }
 
   /* View Toggle */
@@ -1394,20 +1373,20 @@ const CSS_STYLES = `
   /* List View */
   .file-list { display: block !important; min-height: auto; }
   .file-list .file-item {
-    display: grid; grid-template-columns: 40px 1fr 110px 100px; align-items: center;
-    gap: 12px; padding: 10px 16px; border-radius: 0; border-bottom: 1px solid var(--border);
+    display: grid; grid-template-columns: 36px 1fr 100px 80px 70px; align-items: center;
+    gap: 8px; padding: 6px 12px; border-radius: 0; border-bottom: 1px solid var(--border);
     transition: background var(--transition); flex-direction: row;
   }
   .file-list .file-item:first-child { border-top: 1px solid var(--border); }
   .file-list .file-item:hover { background: var(--surface-hover); transform: none; border-color: transparent; border-bottom-color: var(--border); box-shadow: none; }
   .file-list .file-item.selected { background: rgba(0,122,255,0.06); border-color: transparent; border-bottom-color: var(--primary); box-shadow: none; }
-  .file-list .file-icon { font-size: 24px; margin: 0; }
+  .file-list .file-icon { font-size: 20px; margin: 0; }
   .file-list .file-name { text-align: left; word-break: break-all; }
-  .file-list .file-meta { text-align: right; white-space: nowrap; font-size: 13px; }
+  .file-list .file-meta { text-align: right; white-space: nowrap; font-size: 12px; }
   .file-list-header {
-    display: grid; grid-template-columns: 40px 1fr 110px 100px; align-items: center;
-    gap: 12px; padding: 10px 16px; background: rgba(0,0,0,0.02);
-    border-bottom: 1px solid var(--border-strong); font-size: 11px; font-weight: 600;
+    display: grid; grid-template-columns: 36px 1fr 100px 80px 70px; align-items: center;
+    gap: 8px; padding: 6px 12px; background: rgba(0,0,0,0.02);
+    border-bottom: 1px solid var(--border-strong); font-size: 10px; font-weight: 600;
     color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.03em;
   }
   .sortable-header { transition: color var(--transition); }
@@ -1548,6 +1527,7 @@ const CSS_STYLES = `
   .badge-warning { background: rgba(255,149,0,0.12); color: var(--warning); }
   .badge-error { background: rgba(255,59,48,0.12); color: var(--error); }
   .badge-info { background: rgba(0,122,255,0.12); color: var(--primary); }
+  .badge-guest { background: rgba(175,82,222,0.12); color: #af52de; }
 
   /* Table */
   .table-container { overflow-x: auto; }
@@ -1569,12 +1549,6 @@ const CSS_STYLES = `
   .login-header { text-align: center; margin-bottom: 32px; }
   .login-logo { font-size: 28px; font-weight: 700; color: var(--text); margin-bottom: 4px; letter-spacing: -0.02em; }
   .login-subtitle { color: var(--text-muted); font-size: 15px; }
-  .login-tabs { display: flex; gap: 4px; background: var(--surface-hover); border-radius: var(--radius); padding: 4px; margin-bottom: 24px; }
-  .login-tab {
-    flex: 1; padding: 8px 0; border: none; background: transparent; color: var(--text-muted);
-    border-radius: 6px; cursor: pointer; font-size: 13px; transition: all var(--transition);
-  }
-  .login-tab.active { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
 
   .share-card {
     max-width: 480px; text-align: center;
@@ -1692,6 +1666,131 @@ const CSS_STYLES = `
   }
 
   /* Responsive */
+
+  /* Mobile sidebar toggle – hidden on desktop */
+  .sidebar-toggle { display: none; }
+  .sidebar-backdrop { display: none; }
+  .mobile-upload-bar { display: none; }
+
+  @media (max-width: 768px) {
+    html { font-size: 15px; }
+    body { -webkit-tap-highlight-color: transparent; }
+
+    /* Header – stack + compact */
+    .header { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
+    .logo { font-size: 18px; white-space: nowrap; }
+    .search-group { max-width: 100%; width: 100%; margin: 0; order: 3; }
+    .header-actions { width: auto; gap: 4px; }
+    .header-actions .btn { padding: 6px 12px; font-size: 12px; }
+    #adminBtn { display: none; }
+
+    /* Sidebar – hide by default, toggle via JS */
+    .sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 500;
+      width: 260px; background: var(--surface); box-shadow: var(--shadow-lg);
+      flex-direction: column; padding: 60px 12px 20px; gap: 2px;
+      transform: translateX(-100%); transition: transform 0.25s cubic-bezier(0.4,0,0.2,1);
+      overflow-y: auto; border-right: 1px solid var(--border);
+    }
+    .sidebar.open { transform: translateX(0); }
+    .sidebar-title { display: block; padding: 12px 8px 6px; font-size: 11px; }
+    .sidebar-item { padding: 10px 12px; font-size: 14px; width: 100%; }
+    .sidebar-divider { display: block; margin: 8px 8px; }
+    .sidebar-add { margin-top: 4px; font-size: 13px; padding: 10px 12px; }
+    .sidebar-backdrop {
+      display: none; position: fixed; inset: 0; z-index: 499;
+      background: rgba(0,0,0,0.3); backdrop-filter: blur(2px);
+    }
+    .sidebar-backdrop.active { display: block; }
+
+    /* Hamburger menu button */
+    .sidebar-toggle {
+      display: flex; width: 36px; height: 36px; border: 1px solid var(--border);
+      border-radius: var(--radius-sm); background: var(--surface);
+      cursor: pointer; align-items: center; justify-content: center;
+      font-size: 18px; color: var(--text); transition: all var(--transition);
+      flex-shrink: 0;
+    }
+    .sidebar-toggle:hover { background: var(--surface-hover); }
+
+    .main-layout { flex-direction: column; padding: 0; gap: 0; }
+    .main-content { width: 100%; }
+
+    /* Toolbar – hidden on mobile */
+    .toolbar { display: none; }
+
+    /* Container */
+    .container { padding: 0; }
+
+    /* File grid – 2 columns for mobile */
+    .file-grid:not(.file-list) { grid-template-columns: repeat(2, 1fr); gap: 4px; min-height: 100px; }
+    .file-item { padding: 5px 4px; gap: 1px; }
+    .file-item .file-icon { font-size: 28px; }
+    .file-item .file-name { font-size: 18px; line-height: 1.3; }
+
+    /* List view */
+    .file-list .file-item { grid-template-columns: 40px 1fr 68px 50px; gap: 8px; padding: 8px 10px; align-items: center; }
+    .file-list-header { grid-template-columns: 40px 1fr 68px 50px; gap: 8px; padding: 4px 10px; font-size: 12px; }
+    .file-list .file-icon { font-size: 28px; flex-shrink: 0; }
+    .file-list .file-name { font-size: 16px; word-break: break-word; overflow-wrap: anywhere; line-height: 1.3; }
+    .file-list .file-meta { font-size: 12px; text-align: right; flex-shrink: 0; }
+    .file-list .file-meta:last-child { display: none; }
+    .file-list-header > *:nth-child(4) { text-align: right; }
+    .file-list-header > *:nth-child(5) { display: none; }
+
+    /* Breadcrumb */
+    .breadcrumb { font-size: 12px; padding: 4px 12px; }
+
+    /* Modals */
+    .modal { padding: 20px; width: 94%; max-width: 100%; border-radius: var(--radius-lg); }
+    .modal-title { font-size: 16px; }
+    .modal-overlay { align-items: flex-end; }
+    .modal-overlay .modal {
+      border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+      max-height: 90vh; margin-bottom: 0;
+    }
+
+    /* Login / Share cards */
+    .login-card, .share-card { padding: 28px 20px; max-width: 100%; margin: 0 8px; border-radius: var(--radius-lg); }
+    .login-container { padding: 12px; align-items: flex-start; padding-top: 10vh; }
+
+    /* Preview overlay */
+    .preview-header { padding: 10px 14px; gap: 8px; }
+    .preview-filename { font-size: 14px; }
+    .preview-overlay .btn { padding: 6px 12px; font-size: 12px; }
+
+    /* Admin page */
+    .stats-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .stat-card { padding: 18px 12px; }
+    .stat-value { font-size: 28px; }
+    .stat-label { font-size: 12px; }
+
+    /* Admin tables */
+    .table-container { margin: 0 -8px; }
+    th, td { padding: 8px 10px; font-size: 12px; white-space: nowrap; }
+
+    /* Buttons – touch friendly */
+    .btn { min-height: 40px; }
+    .btn-sm { min-height: 32px; padding: 4px 10px; font-size: 11px; }
+    .modal-close { width: 36px; height: 36px; font-size: 24px; }
+
+    /* Form inputs */
+    .form-input, .form-select { padding: 10px 12px; font-size: 16px; }
+
+    /* Card – full width */
+    .card { padding: 12px 8px; border-radius: 0; border: none; box-shadow: none; }
+
+    /* Footer upload bar (fixed bottom) */
+    .mobile-upload-bar {
+      display: flex; position: fixed; bottom: 0; left: 0; right: 0;
+      padding: 10px 14px; padding-bottom: max(10px, env(safe-area-inset-bottom));
+      background: var(--surface); border-top: 1px solid var(--border);
+      box-shadow: 0 -2px 10px rgba(0,0,0,0.06); z-index: 300;
+      gap: 8px;
+    }
+    .mobile-upload-bar .btn { flex: 1; }
+  }
+
 </style>
 `;
 
@@ -1831,6 +1930,16 @@ const LOGIN_PAGE = `
     }
 
     function doLogin(body) {
+      const loginBtn = document.getElementById('loginBtn');
+      const guestBtn = document.getElementById('guestLoginBtn');
+      const emailInp = document.getElementById('email');
+      const passwordInp = document.getElementById('password');
+      loginBtn.disabled = true;
+      loginBtn.textContent = '登录中...';
+      if (guestBtn) guestBtn.disabled = true;
+      if (emailInp) emailInp.disabled = true;
+      if (passwordInp) passwordInp.disabled = true;
+
       fetch('/api/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1840,13 +1949,23 @@ const LOGIN_PAGE = `
       .then(function(data) {
         if (data.success) {
           showToast('登录成功', 'success');
-          setTimeout(function() { window.location.href = '/'; }, 500);
+          window.location.href = '/';
         } else {
           showToast(data.message || '登录失败', 'error');
+          loginBtn.disabled = false;
+          loginBtn.textContent = '登录';
+          if (guestBtn) guestBtn.disabled = false;
+          if (emailInp) emailInp.disabled = false;
+          if (passwordInp) passwordInp.disabled = false;
         }
       })
       .catch(function(error) {
         showToast('登录失败: ' + error.message, 'error');
+        loginBtn.disabled = false;
+        loginBtn.textContent = '登录';
+        if (guestBtn) guestBtn.disabled = false;
+        if (emailInp) emailInp.disabled = false;
+        if (passwordInp) passwordInp.disabled = false;
       });
     }
 
@@ -2330,7 +2449,12 @@ function renderFavorites() {
     return;
   }
   container.innerHTML = favorites.map((f, i) => \`
-    <div class="sidebar-item" data-path="\${f.path}" onclick="navigateTo('\${f.path}')">
+    <div class="sidebar-item" data-path="\${f.path}" data-fav-index="\${i}" draggable="true"
+         ondragstart="onFavDragStart(event, \${i})"
+         ondragover="onFavDragOver(event, \${i})"
+         ondragleave="onFavDragLeave(event)"
+         ondrop="onFavDrop(event, \${i})"
+         onclick="navigateTo('\${f.path}')">
       <span class="sidebar-item-icon">📁</span>
       <span class="sidebar-item-name">\${f.name}</span>
       <button class="sidebar-item-remove" onclick="event.stopPropagation();removeFavorite(\${i})" title="移除收藏">×</button>
@@ -2383,6 +2507,66 @@ async function removeFavorite(index) {
     showToast('移除失败: ' + e.message, 'error');
   }
 }
+
+// --- 收藏夹拖拽排序 ---
+let _favDragIndex = -1;
+
+function onFavDragStart(event, index) {
+  _favDragIndex = index;
+  event.dataTransfer.effectAllowed = 'move';
+  event.dataTransfer.setData('text/plain', index);
+  // 延迟添加 dragging 样式，避免截屏时包含它
+  requestAnimationFrame(() => {
+    event.target.classList.add('sidebar-item-dragging');
+  });
+}
+
+function onFavDragOver(event, toIndex) {
+  event.preventDefault();
+  event.dataTransfer.dropEffect = 'move';
+  const el = event.currentTarget;
+  el.classList.add('sidebar-item-drop-target');
+}
+
+function onFavDragLeave(event) {
+  event.currentTarget.classList.remove('sidebar-item-drop-target');
+}
+
+async function onFavDrop(event, toIndex) {
+  event.preventDefault();
+  event.currentTarget.classList.remove('sidebar-item-drop-target');
+  const fromIndex = _favDragIndex;
+  if (fromIndex < 0 || fromIndex === toIndex) return;
+
+  // 本地重排
+  const [moved] = favorites.splice(fromIndex, 1);
+  favorites.splice(toIndex, 0, moved);
+
+  // 保存新顺序到服务端
+  try {
+    const response = await fetch('/api/favorites/order', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ favorites })
+    });
+    const data = await response.json();
+    if (data.success) {
+      favorites = data.favorites;
+    }
+  } catch (e) {
+    showToast('保存顺序失败: ' + e.message, 'error');
+  }
+
+  _favDragIndex = -1;
+  renderFavorites();
+}
+
+// 拖拽结束时清理
+document.addEventListener('dragend', () => {
+  _favDragIndex = -1;
+  document.querySelectorAll('.sidebar-item-dragging').forEach(el => el.classList.remove('sidebar-item-dragging'));
+  document.querySelectorAll('.sidebar-item-drop-target').forEach(el => el.classList.remove('sidebar-item-drop-target'));
+});
 
 function highlightCurrentFavorite() {
   document.querySelectorAll('.sidebar-item').forEach(el => {
@@ -2616,6 +2800,7 @@ function handleItemClick(event, element) {
   const fileList = document.getElementById('fileList');
   const items = Array.from(fileList.querySelectorAll('.file-item'));
   const currentIndex = items.indexOf(element);
+  const isMobile = window.innerWidth <= 768;
 
   if (isCtrlPressed && isShiftPressed) {
     
@@ -2636,6 +2821,20 @@ function handleItemClick(event, element) {
       selectRange(lastElement, element);
     } else {
       selectSingle(element);
+    }
+  } else if (isMobile) {
+    // 移动端：点击直接打开
+    const type = element.dataset.type;
+    const path = element.dataset.path;
+    if (type === 'folder') {
+      navigateTo(path);
+    } else {
+      const pt = element.dataset.previewType;
+      if (pt) {
+        previewFile(path, pt, element.dataset.name);
+      } else {
+        downloadFile(path);
+      }
     }
   } else {
     
@@ -2770,10 +2969,11 @@ function initMultiSelect() {
           currentUserRole = data.role || 'user';
         }
         if (currentUserRole === 'guest') {
-          showGuestNotice();
+          const guestRoot = (window.__INIT__ && window.__INIT__.guestRoot) || 'guest';
+          showGuestNotice(guestRoot);
           if (currentPath === '/') {
-            currentPath = '/guest/';
-            history = ['/guest/'];
+            currentPath = '/' + guestRoot + '/';
+            history = ['/' + guestRoot + '/'];
             historyIndex = 0;
           }
         }
@@ -2782,11 +2982,12 @@ function initMultiSelect() {
       }
     }
 
-    function showGuestNotice() {
+    function showGuestNotice(guestRoot) {
       const notice = document.createElement('div');
       notice.id = 'guestNotice';
       notice.style.cssText = 'background: var(--warning-bg, #fff3cd); color: var(--warning-text, #856404); padding: 10px 16px; border-radius: 8px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; font-size: 13px;';
-      notice.innerHTML = '📦 游客模式：仅可访问 guest 文件夹，上传文件大小不超过 100MB';
+      const root = guestRoot || 'guest';
+      notice.innerHTML = '📦 游客模式：仅可访问 ' + root + ' 文件夹';
       const mainContent = document.querySelector('.main-content');
       if (mainContent && !document.getElementById('guestNotice')) {
         mainContent.insertBefore(notice, mainContent.firstChild.nextSibling || mainContent.firstChild);
@@ -2833,11 +3034,12 @@ function initMultiSelect() {
       html += '<button class="nav-btn" id="forwardBtn"' + forwardDisabled + ' onclick="goForward()" title="前进">▶</button>';
 
       if (currentUserRole === 'guest') {
+        const guestRoot = (window.__INIT__ && window.__INIT__.guestRoot) || 'guest';
         if (parts.length === 1) {
-          html += ' <span class="breadcrumb-item active">guest</span>';
+          html += ' <span class="breadcrumb-item active">' + guestRoot + '</span>';
         } else {
-          html += ' <a href="javascript:void(0)" class="breadcrumb-item" data-path="/guest">guest</a>';
-          let path = '/guest';
+          html += ' <a href="javascript:void(0)" class="breadcrumb-item" data-path="/' + guestRoot + '">' + guestRoot + '</a>';
+          let path = '/' + guestRoot;
           for (let i = 1; i < parts.length; i++) {
             path += '/' + parts[i];
             html += '<span class="breadcrumb-separator">/</span>';
@@ -2883,8 +3085,10 @@ function initMultiSelect() {
       if (viewMode === 'list') {
         const nameArrow = sortField === 'name' ? (sortAscending ? ' ▲' : ' ▼') : '';
         const sizeArrow = sortField === 'size' ? (sortAscending ? ' ▲' : ' ▼') : '';
+        const timeArrow = sortField === 'time' ? (sortAscending ? ' ▲' : ' ▼') : '';
         html += '<div class="file-list-header"><span></span>';
         html += '<span class="sortable-header' + (sortField === 'name' ? ' active' : '') + '" onclick="toggleSort(\\'name\\')" style="cursor:pointer;user-select:none;">名称' + nameArrow + '</span>';
+        html += '<span class="sortable-header' + (sortField === 'time' ? ' active' : '') + '" onclick="toggleSort(\\'time\\')" style="cursor:pointer;user-select:none;">时间' + timeArrow + '</span>';
         html += '<span class="sortable-header' + (sortField === 'size' ? ' active' : '') + '" onclick="toggleSort(\\'size\\')" style="cursor:pointer;user-select:none;">大小' + sizeArrow + '</span>';
         html += '<span>操作</span></div>';
       }
@@ -2905,6 +3109,10 @@ function initMultiSelect() {
           const cmp = (a.size || 0) - (b.size || 0);
           return sortAscending ? cmp : -cmp;
         }
+        if (sortField === 'time') {
+          const cmp = new Date(a.lastModified || 0) - new Date(b.lastModified || 0);
+          return sortAscending ? cmp : -cmp;
+        }
         return 0;
       });
 
@@ -2919,8 +3127,9 @@ sortedFolders.forEach(folder => {
          data-name="\${escapeHtml(folder.name)}">
       <div class="file-icon">📁</div>
       <div class="file-name">\${escapeHtml(folder.name)}</div>
-      <div class="file-meta">\${viewMode === 'list' ? '文件夹' : '文件夹'}</div>
-      \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:12px;color:var(--text-muted)">双击打开</div>' : ''}
+      \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:10px;color:var(--text-muted)">-</div>' : ''}
+      <div class="file-meta" style="font-size:10px">\${viewMode === 'list' ? '文件夹' : '文件夹'}</div>
+      \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:10px;color:var(--text-muted)">双击打开</div>' : ''}
     </div>
   \`;
 });
@@ -2940,8 +3149,9 @@ sortedFiles.forEach(file => {
          data-preview-type="\${previewType}">
       <div class="file-icon">\${icon}</div>
       <div class="file-name">\${escapeHtml(file.name)}</div>
-      <div class="file-meta">\${file.sizeFormatted}\${previewType && viewMode !== 'list' ? ' <span class="badge badge-info">可预览</span>' : ''}</div>
-      \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:12px;color:var(--text-muted)">' + (previewType ? '可预览 · 右键编辑' : '右键菜单') + '</div>' : ''}
+      \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:10px;color:var(--text-muted)">' + (file.timeFormatted || '-') + '</div>' : ''}
+      <div class="file-meta" style="font-size:10px">\${file.sizeFormatted}\${previewType && viewMode !== 'list' ? ' <span class="badge badge-info">可预览</span>' : ''}</div>
+      \${viewMode === 'list' ? '<div class="file-meta" style="text-align:right;font-size:10px;color:var(--text-muted)">' + (previewType ? '可预览 · 右键编辑' : '右键菜单') + '</div>' : ''}
     </div>
   \`;
 });
@@ -2992,7 +3202,8 @@ sortedFiles.forEach(file => {
     }
 
     function navigateTo(path, fromHistory = false) {
-      if (currentUserRole === 'guest' && !path.startsWith('/guest')) return;
+      const guestRoot = (window.__INIT__ && window.__INIT__.guestRoot) || 'guest';
+      if (currentUserRole === 'guest' && !path.startsWith('/' + guestRoot)) return;
       currentPath = path;
       if (!fromHistory) {
         history = history.slice(0, historyIndex + 1);
@@ -3951,22 +4162,43 @@ const ADMIN_PAGE = `
         if (data.success) {
           const tbody = document.getElementById('usersTable');
 
-          if (data.users.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">暂无授权用户</td></tr>';
-            return;
+          // 游客始终显示在列表顶部，其余为注册用户
+          const guestUser = data.users.find(u => u.email === '__guest__');
+          const normalUsers = data.users.filter(u => u.email !== '__guest__');
+
+          let rowsHtml = '';
+          
+          if (guestUser) {
+            rowsHtml += \`
+              <tr>
+                <td>👤 游客（公共访问）</td>
+                <td><span class="badge badge-guest">游客 · \${guestUser.enabled ? '已启用' : '已禁用'}</span></td>
+                <td>-</td>
+                <td>
+                  <button class="btn btn-sm btn-primary" onclick="showUserPermsModal('__guest__')">权限</button>
+                  <button class="btn btn-sm btn-secondary" onclick="switchTab('settings')">⚙ 开关</button>
+                </td>
+              </tr>
+            \`;
           }
 
-          tbody.innerHTML = data.users.map(user => \`
-            <tr>
-              <td>\${escapeHtml(user.email)}</td>
-              <td>\${user.role === 'admin' ? '管理员' : '普通用户'}</td>
-              <td>\${user.createdAt ? new Date(user.createdAt).toLocaleString() : '-'}</td>
-              <td>
-                <button class="btn btn-sm btn-primary" onclick="showUserPermsModal('\${escapeHtml(user.email)}')">权限</button>
-                <button class="btn btn-sm btn-danger" onclick="deleteUser('\${encodeURIComponent(user.email)}')">撤销授权</button>
-              </td>
-            </tr>
-          \`).join('');
+          if (normalUsers.length === 0) {
+            rowsHtml += '<tr><td colspan="4" style="text-align: center; color: var(--text-muted);">暂无注册用户</td></tr>';
+          } else {
+            rowsHtml += normalUsers.map(user => \`
+              <tr>
+                <td>\${escapeHtml(user.email)}</td>
+                <td>\${user.role === 'admin' ? '管理员' : '普通用户'}</td>
+                <td>\${user.createdAt ? new Date(user.createdAt).toLocaleString() : '-'}</td>
+                <td>
+                  <button class="btn btn-sm btn-primary" onclick="showUserPermsModal('\${escapeHtml(user.email)}')">权限</button>
+                  <button class="btn btn-sm btn-danger" onclick="deleteUser('\${encodeURIComponent(user.email)}')">撤销授权</button>
+                </td>
+              </tr>
+            \`).join('');
+          }
+
+          tbody.innerHTML = rowsHtml;
         }
       } catch (error) {
         showToast('加载用户列表失败', 'error');
@@ -4058,31 +4290,44 @@ const ADMIN_PAGE = `
     // === 用户权限设置 ===
     async function showUserPermsModal(email) {
       _userPermsEmail = email;
-      document.getElementById('permsUserEmail').textContent = email;
+      const isGuest = email === '__guest__';
+      document.getElementById('permsUserEmail').textContent = isGuest ? '游客' : email;
+      // 游客不能修改角色，隐藏角色下拉
+      const roleGroup = document.getElementById('permsRole').parentElement;
+      roleGroup.style.display = isGuest ? 'none' : '';
       document.getElementById('permsRole').value = 'user';
       document.getElementById('permsMaxUpload').value = 0;
-      document.getElementById('permsFolders').value = '';
+      document.getElementById('permsFolders').value = isGuest ? 'guest' : '';
       try {
         const r = await fetch('/api/admin/users/' + encodeURIComponent(email) + '/settings');
         const d = await r.json();
         if (d.success && d.limits) {
           document.getElementById('permsRole').value = d.limits.role || 'user';
           document.getElementById('permsMaxUpload').value = d.limits.maxUploadSize || 0;
-          document.getElementById('permsFolders').value = (d.limits.allowedFolders || []).join(', ');
+          const savedFolders = d.limits.allowedFolders;
+          if (savedFolders && savedFolders.length > 0) {
+            document.getElementById('permsFolders').value = savedFolders.join(', ');
+          } else if (!isGuest) {
+            document.getElementById('permsFolders').value = '';
+          }
         }
       } catch (e) {}
       document.getElementById('userPermsModal').classList.add('active');
     }
 
     async function saveUserPerms() {
+      const isGuest = _userPermsEmail === '__guest__';
       const role = document.getElementById('permsRole').value;
       const maxUploadSize = parseInt(document.getElementById('permsMaxUpload').value) || 0;
       const foldersRaw = document.getElementById('permsFolders').value.trim();
       const allowedFolders = foldersRaw ? foldersRaw.split(',').map(f => f.trim()).filter(f => f.length > 0) : [];
 
+      const body = { maxUploadSize, allowedFolders };
+      if (!isGuest) body.role = role;
+
       await apiCall('/api/admin/users/' + encodeURIComponent(_userPermsEmail) + '/settings', {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role, maxUploadSize, allowedFolders })
+        body: JSON.stringify(body)
       }, '用户权限已更新', () => { closeModal('userPermsModal'); loadUsers(); });
     }
 
@@ -4383,6 +4628,9 @@ export default {
         if (path === '/api/favorites' && method === 'DELETE') {
           return await handleRemoveFavorite(request, env);
         }
+        if (path === '/api/favorites/order' && method === 'PUT') {
+          return await handleReorderFavorites(request, env);
+        }
 
         return jsonResponse({ success: false, message: 'API 路径不存在' }, 404);
       }
@@ -4413,11 +4661,19 @@ export default {
         const favKey = getFavoritesKey(auth);
         const favRaw = await env.KV_STORE.get(favKey);
         const favorites = favRaw ? JSON.parse(favRaw) : [];
-        const initJson = JSON.stringify({
+        const initData = {
           role: auth.role,
           email: auth.email || null,
           favorites: favorites || []
-        });
+        };
+        if (auth.role === 'guest') {
+          const limits = await getUserLimits(env, '__guest__');
+          const allowedFolders = (limits && limits.allowedFolders && limits.allowedFolders.length > 0)
+            ? limits.allowedFolders
+            : ['guest'];
+          initData.guestRoot = allowedFolders[0];
+        }
+        const initJson = JSON.stringify(initData);
         return htmlResponse(INDEX_PAGE.replace('</head>', `<script>window.__INIT__=${initJson};</script></head>`));
       }
 

@@ -9,7 +9,14 @@
 - 三级权限体系 — 管理员 / 注册用户 / 游客，灵活管控
 - 全平台适配 — 暗色模式、移动端响应式布局
 - 安全分享 — 密码保护、有效期控制、访问统计
+- 兼容 WebDAV 的服务
 ---
+## 多版本 
+
+- 多用户版:	worker.js
+- 单用户版:		worker_Single.js
+- WEBdav纯后台版:	worker_webdav.js
+- WEBdav网页UI版:worker_webdavUI.js
 
 ## Cloudflare部署指南
 
@@ -59,7 +66,7 @@
 - R2 存储桶：选择您在前面创建的存储桶。
 
 #### 配置 KV	绑定：
-
+(多用户版需要绑定,其他版本不需要)
 点击:绑定 -> 添加绑定 -> KV 命名空间 -> 添加绑定
 
 - 变量名称：KV_STORE
@@ -96,6 +103,24 @@ ADMIN_PASSWORD = "你的管理员密码"
 - Cookie 机制：HttpOnly、SameSite=Strict、24 小时有效期
 - 管理员可按用户设置文件夹白名单与上传大小限制
 
+### WEBdav功能总览
+
+- 支持操作: 浏览、上传、下载、删除、重命名/移动、复制、创建文件夹、能力声明
+- 支持标准 Basic Auth（WebDAV 客户端用）和 Cookie（浏览器已登录用户自动识别）。
+- 支持协议: WebDAV Class 1 & 2
+- 支持分块上传的 Web 界面上传大文件
+- 完全复用现有 checkPathAccess 权限系统
+	游客默认只能访问 guest 文件夹
+	受限用户只能访问授权文件夹
+- 权限层级（从上到下逐级检查）
+```toml
+全局 WebDAV 开关 (webdavEnabled)
+  └→ 全局只读模式 (webdavReadOnly)
+      └→ 用户级 WebDAV 开关 (per-user webdavEnabled)
+          └→ 用户级只读模式 (per-user webdavReadOnly)
+              └→ 文件夹访问权限 (allowedFolders)
+                  └→ 上传大小限制 (maxUploadSize)
+```
 ### 文件管理
 
 | 操作 | 说明 |
